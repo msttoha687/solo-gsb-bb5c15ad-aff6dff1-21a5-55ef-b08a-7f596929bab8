@@ -33,6 +33,16 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       任一年超年度上限即拒绝。核对通过才**原子更新计划并写审计**；驳回不改变计划。
     - 核对失败（409）会在错误信息与结构化 `details` 中指出**冲突计划、窗外实测、超额年份与各项数值**，
       申请**保持待审**，布展员可撤回后修改重提（也可在提额后由保管员直接批准原申请）。
+11. **下调年度上限（预演 + 凭证）**：保管员下调某展品某自然年的照度时数上限前，可凭「展品、年份、拟定正数上限」**预演**：
+    - 预演**不改任何状态**，返回一次性**预演凭证**（30 分钟有效）与核算结果：该年**已确认实测**、
+      各**已批准/待复核计划的估算残余**、**预计超额量**，以及超额时「仍有该年估算残余且尚未开始」的已批准计划
+      （这些计划将在下调成功后转为待复核；**已开始计划不转状态**，剩余超额仍如实显示）。
+    - **携凭证提交**时，服务端在同一展品锁事务内校验：凭证有效、提交字段与预演一致、且预演后**额度或相关占用未变化**
+      （占用状态指纹：年度上限、已批准/待复核计划窗口、已确认实测）。任一不满足返回 **409** 并给出**最新预演结果与新凭证**。
+    - **不携凭证（沿用旧请求字段直接修改）** 仍然支持：在同一事务内**即时重算**。
+    - 下调成功在同一事务内**原子更新上限**、**保留原审批与实测**，把本次核算列出的未开始计划**转为待复核并写明原因**；
+      不删除任何占用、不自动取消计划。后续复核沿用现有**重叠 + 额度**校验。
+    - 额度查询与修改的成功响应**保持兼容**（修改响应在原展品详情结构上额外附加 `limitChange`）。
 
 ## 一键启动（Docker Compose）
 
@@ -109,7 +119,10 @@ npm run test:utils
    若迟到实测造成年度超限，相应未开始计划转待复核，保管员在详情页复核。
 5. 计划尚未开始时，布展员可在「布展计划」对该计划点「申请调整」，改填展期/开灯时段/照度后提交；
    保管员在计划行内查看原值与拟改值对照及核对结果，选择「批准调整」或「驳回」；布展员可撤回自己的待审申请后重提。
-6. 「操作流水」保留全部审批、调整、确认、状态变更等记录。
+6. 保管员在展品详情中**下调年度上限**时，先输入年份与拟定上限点「预演下调」查看只读核算（凭证、已确认实测、
+   各计划估算残余、预计超额、将转待复核的未开始计划），再「携凭证确认下调」；预演后若占用变化会返回 409 与最新预演。
+   也可「直接保存上限」（同一事务即时重算）。下调后未开始计划转待复核，原审批/实测保留，复核沿用既有重叠+额度校验。
+7. 「操作流水」保留全部审批、调整、确认、上限下调、状态变更等记录。
 
 ## HTTP API（含计划调整申请）
 
@@ -135,7 +148,8 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
 | `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测 |
-| `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限 |
+| `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限（可携 `previewToken`；成功响应额外附加 `limitChange`，其余结构兼容） |
+| `POST /api/exhibits/:id/limits/preview` | 保管员 | **下调预演（只读）**：返回凭证 `previewToken` + 该年实测/计划残余/预计超额/待复核候选 |
 | `GET  /api/plans?exhibitId=` | 登录 | 计划列表（附加 `notStarted`、`pendingAdjustment` 概要） |
 | `POST /api/plans` | 布展员 | 创建计划 |
 | `GET  /api/plans/:id` | 登录 | 计划详情（待审申请带 `preview` 原值/拟改值试算） |
@@ -219,6 +233,111 @@ curl -b cookies.txt -X POST http://localhost:3000/api/adjustments/1/withdraw
 常见拒绝：越权（保管员提交、非申请人撤回）→ 403；计划非已批准/已开始/无效时段或照度 → 400；
 重复待审申请 → 409（`details.existingAdjustmentId`）。
 
+### 下调年度上限预演 `/api/exhibits/:id/limits/preview`
+
+| 方法 & 路径 | 角色 | 说明 |
+| --- | --- | --- |
+| `POST /api/exhibits/:id/limits/preview` | 保管员 | 只读预演，不改状态；返回一次性凭证 `previewToken`（30 分钟） |
+| `POST /api/exhibits/:id/limits` | 保管员 | 携 `previewToken` 提交：占用变化即拒绝并返回新结果；不携凭证则同事务即时重算 |
+
+预演请求体：
+
+```json
+{ "year": 2026, "limitLxh": 500 }
+```
+
+预演响应（`preview` 为核算结果，凭证在最外层）：
+
+```json
+{
+  "previewToken": "a1b2c3…",
+  "expiresAt": "2026-09-30T08:30:00.000Z",
+  "preview": {
+    "exhibitId": 1,
+    "year": 2026,
+    "currentLimit": 5000,
+    "proposedLimit": 500,
+    "isLowering": true,
+    "used": 2600,
+    "projectedExcess": 2100,
+    "confirmedMeasurements": [
+      { "id": 17, "planId": 12, "start": "2026-03-01 09:00", "end": "2026-03-01 17:00",
+        "lux": 150, "yearDose": 1200 }
+    ],
+    "planResidues": [
+      { "id": 12, "title": "三月展", "status": "approved", "residue": 800,
+        "firstStart": "2026-03-01 09:00", "notStarted": false },
+      { "id": 18, "title": "秋季展", "status": "approved", "residue": 600,
+        "firstStart": "2026-10-01 09:00", "notStarted": true }
+    ],
+    "flagCandidates": [
+      { "id": 18, "title": "秋季展", "status": "approved", "residue": 600,
+        "firstStart": "2026-10-01 09:00" }
+    ],
+    "startedStillOver": [
+      { "id": 12, "title": "三月展", "status": "approved", "residue": 800,
+        "firstStart": "2026-03-01 09:00" }
+    ],
+    "generatedAt": "2026-09-30T08:00:00.000Z"
+  }
+}
+```
+
+curl 调用示例（预演 → 携凭证提交；预演后占用变化则按返回的新凭证重试）：
+
+```bash
+# 1) 保管员预演（不改状态，拿凭证）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/1/limits/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"year":2026,"limitLxh":500}'
+
+# 2) 携凭证提交下调（成功响应=展品详情 + limitChange）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/1/limits \
+  -H 'Content-Type: application/json' \
+  -d '{"year":2026,"limitLxh":500,"previewToken":"<上一步返回的 previewToken>"}'
+
+# 3) 沿用旧字段直接修改（不带凭证；同一事务即时重算）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/1/limits \
+  -H 'Content-Type: application/json' \
+  -d '{"year":2026,"limitLxh":500}'
+```
+
+携凭证提交若凭证失效、字段不一致或预演后额度/占用已变化，返回 **409**：
+
+```json
+{
+  "error": "预演后 2026 年额度或相关占用已变化，提交被拒绝，请按最新预演结果重新确认",
+  "details": {
+    "reason": "stale",
+    "previewToken": "新凭证…",
+    "expiresAt": "…",
+    "preview": { "…": "按当前状态重新核算的完整预演结果" }
+  }
+}
+```
+
+`details.reason` 取值：`stale`（占用/额度已变化）、`request_mismatch`（提交字段与预演不一致）、
+`token_invalid`（凭证不存在/已过期/已使用）。下调成功响应在原展品详情结构上额外附加：
+
+```json
+{
+  "exhibit": { "…": "原有字段" },
+  "years": { "…": "原有按年额度" },
+  "plans": ["…"], "measurements": ["…"], "sources": ["…"],
+  "limitChange": {
+    "year": 2026, "previousLimit": 5000, "newLimit": 500, "isLowering": true,
+    "isUpdate": true, "used": 2600, "projectedExcess": 2100,
+    "flagCandidates": [{ "id": 18, "title": "秋季展", "residue": 600, "firstStart": "2026-10-01 09:00" }],
+    "startedStillOver": [{ "id": 12, "title": "三月展", "residue": 800, "firstStart": "2026-03-01 09:00", "status": "approved" }],
+    "flaggedPlans": [{ "id": 18, "title": "秋季展", "firstStart": "2026-10-01 09:00", "overflowYears": [2026] }]
+  }
+}
+```
+
+页面用法：展品详情「登记/修改年度上限」表单中输入年份与拟定正数上限后，点 **预演下调** 查看只读核算面板
+（已确认实测、各计划估算残余、预计超额、将转待复核的未开始计划），再点 **携凭证确认下调**；
+也可直接点 **直接保存上限** 走旧路径（同一事务即时重算）。
+
 
 
 ```
@@ -231,9 +350,10 @@ src/
   schema.sql       表结构
   auth.js          会话与角色中间件、bcrypt 登录校验
   audit.js         操作流水写入
+  limitPreview.js  上限下调预演凭证（一次性、TTL、占用指纹由服务层比对）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对
+  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对、上限下调预演
   routes/          auth/users/exhibits/plans/adjustments/measurements/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试

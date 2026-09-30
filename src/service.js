@@ -599,6 +599,160 @@ function serializeAdjustment(a) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 年度上限下调预演 / 占用状态指纹
+// ---------------------------------------------------------------------------
+
+/** 读取某展品某自然年当前上限（不存在返回 null）。 */
+async function getAnnualLimit(client, exhibitId, year) {
+  const { rows } = await client.query(
+    'SELECT year, limit_lxh FROM annual_limits WHERE exhibit_id = $1 AND year = $2',
+    [exhibitId, year]
+  );
+  return rows.length ? rows[0] : null;
+}
+
+/**
+ * 构造展品占用相关状态的稳定指纹（不依赖驱动行序，按 id 排序）。
+ * 覆盖：各年度上限、占用计划（已批准/待复核）的窗口定义/状态、已确认实测。
+ * 任一项变化都会使指纹变化，用于预演凭证提交时的乐观并发校验。
+ */
+async function occupancyFingerprint(client, exhibitId) {
+  const { rows: limits } = await client.query(
+    'SELECT year, limit_lxh FROM annual_limits WHERE exhibit_id = $1 ORDER BY year',
+    [exhibitId]
+  );
+  const { rows: plans } = await client.query(
+    `SELECT id, status, start_date, end_date, light_periods, estimated_lux
+       FROM plans
+      WHERE exhibit_id = $1 AND status IN ('approved','pending_review')
+      ORDER BY id`,
+    [exhibitId]
+  );
+  const { rows: meas } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts, actual_lux
+       FROM measurements
+      WHERE exhibit_id = $1 AND status = 'confirmed'
+      ORDER BY id`,
+    [exhibitId]
+  );
+  return {
+    limits: limits.map((r) => [r.year, Number(r.limit_lxh)]),
+    plans: plans.map((p) => [
+      p.id,
+      p.status,
+      dateYmd(p.start_date),
+      dateYmd(p.end_date),
+      normalizePeriods(p.light_periods),
+      Number(p.estimated_lux),
+    ]),
+    measurements: meas.map((m) => [
+      m.id,
+      m.plan_id,
+      new Date(m.start_ts).getTime(),
+      new Date(m.end_ts).getTime(),
+      Number(m.actual_lux),
+    ]),
+  };
+}
+
+/**
+ * 上限下调预演（只读，不改任何状态；调用方须已持有展品行锁）。
+ * 返回：
+ *   request/year/
+ *   currentLimit  原上限（无则 null）
+ *   proposedLimit 拟定上限
+ *   isLowering    是否为“已有上限且拟下调”
+ *   confirmedMeasurements 该年已确认实测（含该年剂量分量）
+ *   planResidues  各已批准/待复核计划在该年的估算残余
+ *   used          该年当前占用（已确认实测 + 计划估算残余）
+ *   projectedExcess 预计超额量（>0 时超限；未登记原上限按 null 处理）
+ *   flagCandidates 超额且会被转待复核的已批准、未开始、该年仍有残余的计划
+ *   startedStillOver 已开始/待复核而不会被转状态、但该年仍有残余的计划（供页面提示剩余超额）
+ */
+async function buildLimitPreview(client, exhibitId, year, proposedLimit, nowMs = Date.now()) {
+  const limitRow = await getAnnualLimit(client, exhibitId, year);
+  const currentLimit = limitRow ? round3(Number(limitRow.limit_lxh)) : null;
+  const proposed = round3(Number(proposedLimit));
+  const isLowering = currentLimit !== null && proposed < currentLimit;
+
+  const occupancy = await computeOccupancy(client, exhibitId);
+
+  const key = String(year);
+  const confirmedMeasurements = occupancy.sources
+    .filter((s) => s.kind === 'measurement' && (s.yearly[key] || 0) > 0)
+    .map((s) => ({
+      id: s.id,
+      planId: s.planId,
+      start: s.start,
+      end: s.end,
+      lux: s.lux,
+      yearDose: round3(s.yearly[key]),
+    }));
+
+  const planResidues = occupancy.sources
+    .filter((s) => s.kind === 'plan' && (s.yearly[key] || 0) > 0)
+    .map((s) => ({
+      id: s.id,
+      title: s.title,
+      status: s.status,
+      startDate: dateYmd(s.startDate),
+      endDate: dateYmd(s.endDate),
+      periods: s.periods,
+      estimatedLux: s.lux,
+      residue: round3(s.yearly[key]),
+      firstStart: null,
+    }));
+
+  // 计划原始行（供首个开灯时刻判断）
+  const planById = new Map(occupancy.plans.map((p) => [Number(p.id), p]));
+  const flagCandidates = [];
+  const startedStillOver = [];
+  for (const item of planResidues) {
+    const plan = planById.get(Number(item.id));
+    const firstStart = plan ? planFirstStart(plan) : null;
+    item.firstStart = firstStart === null ? null : tsToWallString(firstStart);
+    item.notStarted = plan ? planNotStarted(plan, nowMs) : false;
+    const row = {
+      id: item.id,
+      title: item.title,
+      status: item.status,
+      residue: item.residue,
+      firstStart: item.firstStart,
+    };
+    if (item.status === 'approved' && item.notStarted) {
+      flagCandidates.push(row);
+    } else {
+      // 已开始的已批准计划，或本就待复核的计划：不会因下调而再次转状态
+      startedStillOver.push(row);
+    }
+  }
+
+  const used = round3(occupancy.used[key] || 0);
+  const projectedExcess = used - proposed > 0.005 ? round3(used - proposed) : 0;
+
+  return {
+    exhibitId,
+    year,
+    currentLimit,
+    proposedLimit: proposed,
+    isLowering,
+    used,
+    projectedExcess,
+    confirmedMeasurements,
+    planResidues,
+    flagCandidates,
+    startedStillOver,
+    generatedAt: new Date(nowMs).toISOString(),
+  };
+}
+
+/** 给预演结果附加当前占用状态指纹（凭证提交时比对用）。 */
+async function attachLimitPreviewFingerprint(client, exhibitId, preview) {
+  const fingerprint = await occupancyFingerprint(client, exhibitId);
+  return { ...preview, fingerprint };
+}
+
 module.exports = {
   ACTIVE_PLAN_STATUSES,
   lockExhibit,
@@ -623,4 +777,9 @@ module.exports = {
   evaluateAdjustment,
   decoratePlans,
   serializeAdjustment,
+  // 上限下调预演
+  getAnnualLimit,
+  occupancyFingerprint,
+  buildLimitPreview,
+  attachLimitPreviewFingerprint,
 };

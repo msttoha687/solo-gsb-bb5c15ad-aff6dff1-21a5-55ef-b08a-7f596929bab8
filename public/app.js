@@ -9,6 +9,7 @@ const state = {
   measurements: [],
   users: [],
   adjustments: [],
+  limitPreview: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -176,6 +177,7 @@ async function openDetail(id) {
   $('#exhibit-list').classList.add('hidden');
   $('#new-exhibit-btn').classList.add('hidden');
   $('#exhibit-detail').classList.remove('hidden');
+  clearLimitPreview();
   renderDetail();
 }
 $('#close-detail').addEventListener('click', () => {
@@ -183,6 +185,7 @@ $('#close-detail').addEventListener('click', () => {
   $('#exhibit-detail').classList.add('hidden');
   $('#exhibit-list').classList.remove('hidden');
   $('#new-exhibit-btn').classList.remove('hidden');
+  clearLimitPreview();
 });
 
 function renderDetail() {
@@ -335,18 +338,161 @@ function measRow(m) {
   </tr>`;
 }
 
-$('#limit-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
+function readLimitForm() {
+  const form = $('#limit-form');
+  const fd = new FormData(form);
+  return {
+    year: Number(fd.get('year')),
+    limitLxh: Number(fd.get('limitLxh')),
+  };
+}
+
+function clearLimitPreview() {
+  state.limitPreview = null;
+  $('#limit-preview-box').classList.add('hidden');
+  $('#limit-preview-box').innerHTML = '';
+}
+
+/** 渲染上限下调预演结果（只读核算 + 凭证确认）。 */
+function renderLimitPreview(data) {
+  state.limitPreview = data;
+  const pv = data.preview;
+  const box = $('#limit-preview-box');
+  box.classList.remove('hidden');
+
+  const measRows = (pv.confirmedMeasurements || []).map((m) =>
+    `<tr><td>${m.id}</td><td>#${m.planId}</td>
+      <td>${esc(m.start)} ~ ${esc(m.end)}</td>
+      <td class="mono">${fmtN(m.lux)} lx</td>
+      <td class="mono">${fmtN(m.yearDose)}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">该年暂无已确认实测</td></tr>';
+
+  const residueRows = (pv.planResidues || []).map((p) =>
+    `<tr>
+      <td>${p.id}</td><td>${esc(p.title)}</td><td>${badge(p.status)}</td>
+      <td class="mono">${fmtN(p.residue)}</td>
+      <td>${p.firstStart ? esc(p.firstStart) : '—'}</td>
+      <td>${p.status === 'approved'
+        ? (p.notStarted ? '<span class="ok">尚未开始</span>' : '<span style="color:#b42318">已开始（不转状态）</span>')
+        : '<span class="muted">本就待复核</span>'}</td>
+    </tr>`).join('')
+    || '<tr><td colspan="6" class="muted">该年暂无计划估算残余</td></tr>';
+
+  const excessBlock = pv.projectedExcess > 0
+    ? `<div class="adj-conflict"><b>预计 ${pv.year} 年超额 ${fmtN(pv.projectedExcess)} lx·h</b>
+         （当前占用 ${fmtN(pv.used)}，拟定上限 ${fmtN(pv.proposedLimit)}）
+         <div class="small" style="margin-top:4px">下调成功后，下列“尚未开始”的已批准计划将转为待复核，
+         原审批与实测保留；已开始/待复核计划不转状态，剩余超额仍需通过后续复核/提额处理。</div></div>`
+    : `<div class="adj-ok">预计 ${pv.year} 年不超额（当前占用 ${fmtN(pv.used)}，
+         拟定上限 ${fmtN(pv.proposedLimit)}，剩余 ${fmtN(pv.proposedLimit - pv.used)} lx·h）</div>`;
+
+  const candList = (pv.flagCandidates || []).length
+    ? '<ul>' + pv.flagCandidates.map((c) =>
+        `<li>计划 #${c.id}「${esc(c.title)}」：该年残余 ${fmtN(c.residue)} lx·h，
+         首个开灯时刻 ${esc(c.firstStart || '—')} → 将转待复核</li>`).join('') + '</ul>'
+    : (pv.projectedExcess > 0
+      ? '<div class="small muted">超额年度没有“尚未开始且该年仍有残余”的已批准计划，本次下调不会转待复核任何计划（剩余超额仍如实显示）。</div>'
+      : '');
+
+  box.innerHTML = `
+    <div class="panel-head">
+      <h4>预演：${pv.year} 年上限 ${pv.currentLimit === null ? '（尚未登记）' : fmtN(pv.currentLimit)}
+        → ${fmtN(pv.proposedLimit)} lx·h</h4>
+      <button id="limit-preview-close" class="link" type="button">收起</button>
+    </div>
+    <p class="muted small">预演不修改任何状态。凭证有效期至 ${new Date(data.expiresAt).toLocaleString('zh-CN')}；
+      携凭证提交时若额度或相关占用已变化，将返回 409 与最新预演结果。</p>
+    ${excessBlock}
+    ${candList ? `<div class="small"><b>将转待复核的计划：</b>${candList}</div>` : candList}
+    ${(pv.startedStillOver || []).length
+      ? `<div class="small muted">不转状态但该年仍有残余：` +
+        pv.startedStillOver.map((c) => `#${c.id}「${esc(c.title)}」（${STATUS_TEXT[c.status] || c.status}，残余 ${fmtN(c.residue)}）`).join('、') +
+        `</div>` : ''}
+    <h4>该年已确认实测</h4>
+    <table class="data">
+      <thead><tr><th>#</th><th>计划</th><th>时段</th><th>实测照度</th><th>该年剂量</th></tr></thead>
+      <tbody>${measRows}</tbody>
+    </table>
+    <h4>各已批准/待复核计划的估算残余（${pv.year} 年）</h4>
+    <table class="data">
+      <thead><tr><th>#</th><th>名称</th><th>状态</th><th>该年残余</th><th>首个开灯时刻</th><th>是否尚未开始</th></tr></thead>
+      <tbody>${residueRows}</tbody>
+    </table>
+    <div class="adj-btns">
+      <button id="limit-commit-btn" class="primary" type="button">携凭证确认下调</button>
+      <button id="limit-repreview-btn" type="button">重新预演</button>
+    </div>`;
+
+  $('#limit-preview-close').addEventListener('click', clearLimitPreview);
+  $('#limit-repreview-btn').addEventListener('click', () => doLimitPreview());
+  $('#limit-commit-btn').addEventListener('click', () => commitLimit(data.previewToken));
+}
+
+async function doLimitPreview() {
+  const fields = readLimitForm();
+  try {
+    const data = await api(
+      'POST',
+      `/api/exhibits/${state.detail.exhibit.id}/limits/preview`,
+      fields
+    );
+    renderLimitPreview(data);
+    flash('success', '预演完成（未修改任何状态），请核对后确认下调');
+  } catch (err) {
+    clearLimitPreview();
+    flash('error', err.message);
+  }
+}
+
+$('#limit-preview-btn').addEventListener('click', doLimitPreview);
+
+/** 携凭证提交（或 fields 缺省走“直接保存”，同一事务即时重算）。 */
+async function commitLimit(token, fields0) {
+  const fields = fields0 || readLimitForm();
   try {
     const detail = await api('POST', `/api/exhibits/${state.detail.exhibit.id}/limits`, {
-      year: Number(fd.get('year')),
-      limitLxh: Number(fd.get('limitLxh')),
+      ...fields,
+      ...(token ? { previewToken: token } : {}),
     });
     state.detail = detail;
     renderDetail();
-    flash('success', '年度上限已保存');
-  } catch (err) { flash('error', err.message); }
+    clearLimitPreview();
+    const lc = detail.limitChange;
+    if (lc && lc.isLowering && lc.projectedExcess > 0) {
+      const html = (lc.flaggedPlans || []).length
+        ? '<div>已转待复核：' + lc.flaggedPlans.map((p) => `#${p.id}《${esc(p.title)}》`).join('、') + '</div>'
+          + ((lc.startedStillOver || []).length
+            ? '<div class="muted">不转状态但仍有残余：' +
+              lc.startedStillOver.map((c) => `#${c.id}`).join('、') + '</div>'
+            : '')
+        : '<div>没有可转待复核的未开始计划，剩余超额已如实显示。</div>';
+      flash('warn',
+        `${lc.year} 年上限已下调至 ${fmtN(lc.newLimit)}，预计超额 ${fmtN(lc.projectedExcess)} lx·h`,
+        html);
+    } else {
+      flash('success', '年度上限已保存');
+    }
+  } catch (err) {
+    const d = err.data || {};
+    const fresh = d.details || d;
+    if (err.status === 409 && fresh.preview) {
+      // 凭证过期/字段不一致/状态已变化：展示返回的最新预演与新凭证
+      if (state.detail) {
+        renderDetail();
+      }
+      renderLimitPreview({ previewToken: fresh.previewToken, expiresAt: fresh.expiresAt,
+        preview: fresh.preview });
+      flash('warn', err.message);
+      return;
+    }
+    flash('error', err.message);
+  }
+}
+
+$('#limit-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  // 沿用原请求字段直接修改：不带凭证，服务端在同一事务即时重算
+  commitLimit(null);
 });
 
 async function planAction(btn) {

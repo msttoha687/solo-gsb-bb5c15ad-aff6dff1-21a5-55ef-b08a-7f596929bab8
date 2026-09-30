@@ -617,12 +617,185 @@ async function runFlow() {
     r.body.adjustments.some((a) => a.status === 'approved'),
     '按计划查询调整历史');
 
+  // =======================================================================
+  // 年度上限下调预演（预演凭证 / 乐观并发 / 原子下调转待复核）
+  // =======================================================================
+  // 墙上时间日期工具（与服务端同一固定偏移）
+  const tzConfig = require('../src/config');
+  const wallDate = (d) => {
+    const sh = new Date(d.getTime() + tzConfig.tzOffsetMs);
+    return `${sh.getUTCFullYear()}-${String(sh.getUTCMonth() + 1).padStart(2, '0')}-${String(sh.getUTCDate()).padStart(2, '0')}`;
+  };
+  const wallYear = (d) => new Date(d.getTime() + tzConfig.tzOffsetMs).getUTCFullYear();
+  const todayRaw = new Date();
+  const yearNow = wallYear(todayRaw);
+  const spanStart = wallDate(new Date(Date.now() - 5 * 86400000));
+  const endRaw = new Date(Date.now() + 35 * 86400000);
+  const spanEnd = wallDate(endRaw);
+  const endYear = wallYear(endRaw);
+  const futureRaw = new Date(Date.now() + 60 * 86400000);
+  const futureDate = wallDate(futureRaw);
+  const futureYear = wallYear(futureRaw);
+  const todayStr = wallDate(todayRaw);
+
+  const exLow = await createExhibit('下调预演展品');
+  // 先给跨越的两个年份充足额度，批准后再把 yearNow 下调到 5000
+  await call('POST', `/api/exhibits/${exLow}/limits`, { year: yearNow, limitLxh: 100000 }, 'c');
+  await call('POST', `/api/exhibits/${exLow}/limits`, { year: endYear, limitLxh: 100000 }, 'c');
+
+  // 已开始（跨今天）计划：每天 09:00-10:00，100lx => 每天 100 lx·h
+  const planSpan = await submitPlan(exLow, '已开始跨期计划', spanStart, spanEnd,
+    ['09:00-10:00'], 100);
+  await approvePlan(planSpan);
+  // 尚未开始计划：06:00-07:00 不与 span 重叠，100lx
+  const planFuture = await submitPlan(exLow, '未开始计划', futureDate, futureDate,
+    ['06:00-07:00'], 100);
+  await approvePlan(planFuture);
+
+  // 越权：布展员不能预演/修改上限
+  r = await call('POST', `/api/exhibits/${exLow}/limits/preview`,
+    { year: yearNow, limitLxh: 5000 }, 'i');
+  assert(r.status === 403, '布展员不能预演上限下调');
+  // 输入校验
+  r = await call('POST', `/api/exhibits/${exLow}/limits/preview`,
+    { year: yearNow, limitLxh: 0 }, 'c');
+  assert(r.status === 400 && /正数/.test(r.body.error), '非正上限预演被拒绝');
+
+  // 把 yearNow 上限直接下调到 5000（当前占用远低于此，不超额）
+  r = await call('POST', `/api/exhibits/${exLow}/limits`, { year: yearNow, limitLxh: 5000 }, 'c');
+  assert(r.status === 200 && r.body.limitChange.isLowering === true &&
+    r.body.limitChange.projectedExcess === 0, '直接下调到 5000 不超额，成功');
+
+  // 预演下调到 500：预计超额；列出实测/残余/候选
+  r = await call('POST', `/api/exhibits/${exLow}/limits/preview`,
+    { year: yearNow, limitLxh: 500 }, 'c');
+  assert(r.status === 200, '下调预演成功（只读）');
+  const pv1 = r.body;
+  assert(pv1.previewToken && pv1.preview.currentLimit === 5000 &&
+    pv1.preview.proposedLimit === 500 && pv1.preview.isLowering === true,
+    '预演返回凭证与上下限');
+  assert(pv1.preview.projectedExcess > 0, '预演预计超额');
+  assert(pv1.preview.used > 500, `预演已用=${pv1.preview.used} 应大于 500`);
+  // 计划残余列出：span（已开始）+ future（仅当同年）
+  const residueIds = pv1.preview.planResidues.map((p) => p.id);
+  assert(residueIds.includes(planSpan), '预演列出已开始计划的该年估算残余');
+  if (futureYear === yearNow) {
+    assert(residueIds.includes(planFuture), '同年未开始计划的残余也列出');
+    assert(pv1.preview.flagCandidates.some((c) => c.id === planFuture),
+      '超额时未开始已批准计划在 flagCandidates 中');
+  }
+  // 已开始计划不进候选
+  assert(!pv1.preview.flagCandidates.some((c) => c.id === planSpan),
+    '已开始计划不在待复核候选中');
+  assert(pv1.preview.startedStillOver.some((c) => c.id === planSpan),
+    '已开始计划列入 startedStillOver（剩余超额如实显示）');
+  // 预演不改状态
+  r = await call('GET', `/api/plans/${planSpan}`, null, 'i');
+  assert(r.body.plan.status === 'approved', '预演不改变计划状态');
+
+  // 携凭证提交下调
+  r = await call('POST', `/api/exhibits/${exLow}/limits`,
+    { year: yearNow, limitLxh: 500, previewToken: pv1.previewToken }, 'c');
+  assert(r.status === 200, '携凭证下调成功');
+  assert(r.body.limitChange.projectedExcess === pv1.preview.projectedExcess,
+    '成功响应给出预计超额量');
+  if (futureYear === yearNow) {
+    assert(r.body.limitChange.flaggedPlans.some((p) => p.id === planFuture),
+      '下调成功把未开始计划转待复核');
+    r = await call('GET', `/api/plans/${planFuture}`, null, 'i');
+    assert(r.body.plan.status === 'pending_review' && /下调/.test(r.body.plan.review_reason),
+      '未开始计划已转待复核，原因写明额度下调');
+    // 已开始计划不转状态
+    r = await call('GET', `/api/plans/${planSpan}`, null, 'i');
+    assert(r.body.plan.status === 'approved', '已开始计划保持已批准');
+    // 后续复核沿用现有重叠+额度校验：仍超额 -> 409，不删除占用、不自动取消
+    r = await call('POST', `/api/plans/${planFuture}/approve`, {}, 'c');
+    assert(r.status === 409, '超额未解除时，待复核计划复核仍被拒绝');
+  }
+  // 凭证一次性：重复使用被拒，并返回新凭证与最新结果
+  r = await call('POST', `/api/exhibits/${exLow}/limits`,
+    { year: yearNow, limitLxh: 500, previewToken: pv1.previewToken }, 'c');
+  assert(r.status === 409 && r.body.details.reason === 'token_invalid' &&
+    r.body.details.previewToken && r.body.details.preview,
+    '重复使用凭证被拒绝（409），并返回新凭证与最新预演');
+
+  // 预演后“相关占用已变化”（新增确认实测），携旧凭证提交 -> stale
+  const exStale = await createExhibit('预演并发展品');
+  await call('POST', `/api/exhibits/${exStale}/limits`, { year: yearNow, limitLxh: 100000 }, 'c');
+  if (endYear !== yearNow) {
+    await call('POST', `/api/exhibits/${exStale}/limits`, { year: endYear, limitLxh: 100000 }, 'c');
+  }
+  const staleSpan = await submitPlan(exStale, '已开始跨期计划', spanStart, spanEnd,
+    ['09:00-10:00'], 100);
+  await approvePlan(staleSpan);
+  r = await call('POST', `/api/exhibits/${exStale}/limits/preview`,
+    { year: yearNow, limitLxh: 100 }, 'c');
+  assert(r.status === 200, 'stale 展品预演成功');
+  const staleToken = r.body.previewToken;
+  const staleExcessBefore = r.body.preview.projectedExcess;
+  // 预演之后确认一条新实测（落在已开始计划窗口内，今天 09-10），占用发生变化
+  const measStale = await call('POST', '/api/measurements', {
+    planId: staleSpan, startDate: todayStr, startTime: '09:00',
+    endDate: todayStr, endTime: '10:00', actualLux: 1000,
+  }, 'c');
+  assert(measStale.status === 201, '录入并发实测');
+  await call('POST', `/api/measurements/${measStale.body.measurement.id}/confirm`, {}, 'c');
+  r = await call('POST', `/api/exhibits/${exStale}/limits`,
+    { year: yearNow, limitLxh: 100, previewToken: staleToken }, 'c');
+  assert(r.status === 409 && r.body.details.reason === 'stale',
+    '预演后占用变化，携旧凭证提交被拒绝（stale）');
+  assert(r.body.details.preview.projectedExcess > staleExcessBefore,
+    '拒绝时返回的新预演结果体现已变化的占用（超额更大）');
+  assert(r.body.details.previewToken, 'stale 拒绝返回新凭证');
+  // 携返回的新凭证提交 -> 成功
+  r = await call('POST', `/api/exhibits/${exStale}/limits`,
+    { year: yearNow, limitLxh: 100, previewToken: r.body.details.previewToken }, 'c');
+  assert(r.status === 200, '携最新凭证提交成功');
+  assert(r.body.limitChange.projectedExcess > 0, '下调后剩余超额如实显示');
+
+  // 提交字段与预演不一致 -> request_mismatch，返回按当前字段核算的新结果
+  r = await call('POST', `/api/exhibits/${exStale}/limits/preview`,
+    { year: yearNow, limitLxh: 50 }, 'c');
+  r = await call('POST', `/api/exhibits/${exStale}/limits`,
+    { year: yearNow, limitLxh: 60, previewToken: r.body.previewToken }, 'c');
+  assert(r.status === 409 && r.body.details.reason === 'request_mismatch' &&
+    r.body.details.preview.proposedLimit === 60,
+    '字段不一致拒绝，并返回按拟定值 60 的新预演');
+
+  // 沿用旧字段直接修改（不带凭证）：同一事务即时重算，下调仍转待复核
+  // 先提额解除超额，把 future 计划复核通过，再直接下调验证
+  r = await call('POST', `/api/exhibits/${exLow}/limits`, { year: yearNow, limitLxh: 100000 }, 'c');
+  assert(r.status === 200, '提额解除超额');
+  if (futureYear === yearNow) {
+    r = await call('POST', `/api/plans/${planFuture}/approve`, {}, 'c');
+    assert(r.status === 200, '提额后待复核计划复核通过');
+    r = await call('POST', `/api/exhibits/${exLow}/limits`, { year: yearNow, limitLxh: 300 }, 'c');
+    assert(r.status === 200, '不带凭证直接下调成功（事务内即时重算）');
+    r = await call('GET', `/api/plans/${planFuture}`, null, 'i');
+    assert(r.body.plan.status === 'pending_review', '直接下调同样把未开始计划转待复核');
+  }
+
+  // 未登记年份：预演可正常核算（currentLimit=null, isLowering=false），提交为首次登记不转待复核
+  const virginYear = 2099;
+  r = await call('POST', `/api/exhibits/${exLow}/limits/preview`,
+    { year: virginYear, limitLxh: 1000 }, 'c');
+  assert(r.status === 200 && r.body.preview.currentLimit === null &&
+    r.body.preview.isLowering === false && r.body.preview.used === 0,
+    '未登记年份预演：无原上限、占用 0');
+  r = await call('POST', `/api/exhibits/${exLow}/limits`,
+    { year: virginYear, limitLxh: 1000, previewToken: r.body.previewToken }, 'c');
+  assert(r.status === 200 && r.body.limitChange.isUpdate === false &&
+    r.body.limitChange.flaggedPlans.length === 0, '首次登记成功且不转任何计划状态');
+
+  // 现有额度查询响应保持兼容
+  r = await call('GET', `/api/exhibits/${exLow}`, null, 'i');
+  assert(r.body.years[String(yearNow)] && r.body.years[String(virginYear)].limit === 1000,
+    '展品详情按年额度查询兼容');
+
   // ---- 操作流水存在 ----
   r = await call('GET', '/api/audit?limit=1000', null, 'c');
   assert(r.status === 200 && r.body.events.some((e) => e.action === 'plan.approve'),
     '操作流水记录了审批事件');
-  assert(r.body.events.some((e) => e.action === 'plan.adjustment.submit'),
-    '操作流水记录了调整申请提交');
   assert(r.body.events.some((e) => e.action === 'plan.adjustment.approve'),
     '操作流水记录了调整申请批准');
   assert(r.body.events.some((e) => e.action === 'plan.update_via_adjustment'),
@@ -631,6 +804,11 @@ async function runFlow() {
     '操作流水记录了调整申请撤回');
   assert(r.body.events.some((e) => e.action === 'plan.adjustment.reject'),
     '操作流水记录了调整申请驳回');
+  assert(r.body.events.some((e) => e.action === 'limit.lower'),
+    '操作流水记录了上限下调核算');
+  assert(r.body.events.some((e) => e.action === 'plan.flag_review' &&
+    e.detail && e.detail.trigger === 'limit_lower'),
+    '操作流水记录了下调触发的转待复核');
 }
 
 main().catch((err) => {
