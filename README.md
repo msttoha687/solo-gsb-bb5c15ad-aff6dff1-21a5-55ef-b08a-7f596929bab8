@@ -33,6 +33,15 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       任一年超年度上限即拒绝。核对通过才**原子更新计划并写审计**；驳回不改变计划。
     - 核对失败（409）会在错误信息与结构化 `details` 中指出**冲突计划、窗外实测、超额年份与各项数值**，
       申请**保持待审**，布展员可撤回后修改重提（也可在提额后由保管员直接批准原申请）。
+11. **下调年度上限（预演 + 凭证提交）**：保管员下调既有自然年的照度时数上限时，可先**预演**：
+    - 预演**不改任何状态**，返回一次性**预演凭证**并列出：该年**已确认实测**、各已批准/待复核计划在该年的**估算残余**、
+      **预计超额量**，以及超额时**仍有该年估算残余且尚未开始的已批准计划**（下调后将转待复核）。
+    - 携凭证正式提交时在同一展品锁事务内**即时重算**：若自预演以来**额度或相关占用已变化**（上限被改、实测确认/录入、
+      计划批准/取消/转复核/调整生效等），返回 **409 拒绝并附带最新核算结果与新凭证**，本次不改动任何数据。
+    - 沿用旧请求字段直接修改上限（`POST /limits`）时在**同一事务即时重算**，不再要求凭证。
+    - 下调成功**原子更新上限**，**原审批记录与实测记录全部保留**；把本次核算列出的未开始计划**转为待复核并写明原因**；
+      **已开始的计划不转状态**，剩余超额仍在额度查询/页面中如实显示。后续复核沿用既有的重叠与额度校验，
+      不删除占用、不自动取消计划。
 
 ## 一键启动（Docker Compose）
 
@@ -109,9 +118,13 @@ npm run test:utils
    若迟到实测造成年度超限，相应未开始计划转待复核，保管员在详情页复核。
 5. 计划尚未开始时，布展员可在「布展计划」对该计划点「申请调整」，改填展期/开灯时段/照度后提交；
    保管员在计划行内查看原值与拟改值对照及核对结果，选择「批准调整」或「驳回」；布展员可撤回自己的待审申请后重提。
-6. 「操作流水」保留全部审批、调整、确认、状态变更等记录。
+6. 需要**下调**某展品某自然年上限时，保管员在展品详情填写年份与拟定上限后点「下调预演」：
+   页面列出该年已确认实测、各计划估算残余、预计超额量，以及将被转待复核的未开始计划；
+   确认后在预演结果中点「提交下调」。若预演后占用被他人改动，提交会被拒绝并自动展示最新预演结果。
+   已开始计划不会被转状态，剩余超额继续在额度表中红色显示，待复核计划由保管员复核（沿用既有重叠/额度校验）。
+7. 「操作流水」保留全部审批、调整、确认、上限下调、状态变更等记录。
 
-## HTTP API（含计划调整申请）
+## HTTP API（含计划调整申请、年度上限下调预演）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -135,7 +148,9 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
 | `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测 |
-| `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限 |
+| `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限；**若为下调，同事务即时重算并把超额年未开始计划转待复核**（成功响应仍为展品详情，另附 `overflows`/`flaggedPlans`） |
+| `POST /api/exhibits/:id/limits/preview` | 保管员 | **下调预演**：不改状态，返回凭证与该年实测/各计划估算残余/预计超额/将转复核的计划 |
+| `POST /api/exhibits/:id/limits/lower` | 保管员 | **携预演凭证提交下调**；占用已变化返回 409 + 最新结果与新凭证 |
 | `GET  /api/plans?exhibitId=` | 登录 | 计划列表（附加 `notStarted`、`pendingAdjustment` 概要） |
 | `POST /api/plans` | 布展员 | 创建计划 |
 | `GET  /api/plans/:id` | 登录 | 计划详情（待审申请带 `preview` 原值/拟改值试算） |
@@ -219,6 +234,84 @@ curl -b cookies.txt -X POST http://localhost:3000/api/adjustments/1/withdraw
 常见拒绝：越权（保管员提交、非申请人撤回）→ 403；计划非已批准/已开始/无效时段或照度 → 400；
 重复待审申请 → 409（`details.existingAdjustmentId`）。
 
+### 下调年度上限 `/api/exhibits/:id/limits/preview`、`/lower`
+
+保管员下调**已登记**年度上限前先预演（拟定上限必须为正数且**低于现行上限**，否则 400）。
+预演不写库，返回一次性、10 分钟有效的凭证（`token`）：
+
+```bash
+# 1) 预演：返回 token 与核算明细
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/1/limits/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"year":2032,"limitLxh":800}'
+```
+
+响应（`preview`）：
+
+```json
+{
+  "year": 2032,
+  "currentLimit": 10000,
+  "proposedLimit": 800,
+  "used": 1600,
+  "remaining": -800,
+  "excess": 800,
+  "over": true,
+  "confirmedMeasurements": [],
+  "planResidues": [
+    { "id": 7, "title": "未来计划1", "status": "approved", "startDate": "2032-06-01",
+      "endDate": "2032-06-01", "periods": ["09:00-17:00"], "lux": 100,
+      "yearResidue": 800, "firstStart": "2032-06-01 09:00", "notStarted": true }
+  ],
+  "flagCandidates": [ { "id": 7, "title": "未来计划1", "yearResidue": 800, "notStarted": true } ],
+  "startedResiduePlans": [],
+  "token": "b93e982e4ac7…",
+  "tokenExpiresInSeconds": 600
+}
+```
+
+```bash
+# 2) 携凭证提交（字段须与预演一致；token 一次性）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/1/limits/lower \
+  -H 'Content-Type: application/json' \
+  -d '{"year":2032,"limitLxh":800,"token":"b93e982e4ac7…"}'
+```
+
+成功响应即**展品详情**（与 `GET /api/exhibits/:id` 同构，保持兼容），并额外附带：
+
+```json
+{
+  "exhibit": { }, "years": { }, "sources": [ ], "plans": [ ], "measurements": [ ],
+  "year": 2032,
+  "previousLimit": 10000,
+  "newLimit": 800,
+  "overflows": [{ "year": 2032, "limit": 800, "previousLimit": 10000,
+                  "projected": 1600, "excess": 800 }],
+  "flaggedPlans": [
+    { "id": 7, "title": "未来计划1", "firstStart": "2032-06-01 09:00",
+      "yearResidue": 800, "overflowYears": [2032] }
+  ]
+}
+```
+
+被转待复核的计划会写入中文原因（如“2032 年照度时数上限下调（10000 → 800 lx·h）后预计超额 800 lx·h，
+本计划该年估算残余 800 lx·h，转待复核”），`approved_by/approved_at` 与实测记录原样保留。
+若预演后额度或相关占用被改动，提交返回 **409**，且 `details.preview` 为**最新核算结果（含新 token）**：
+
+```json
+{
+  "error": "自预演以来 2032 年额度或相关占用已变化，本次下调未执行；请按最新核算结果确认后重新提交",
+  "details": {
+    "preview": { "year": 2032, "currentLimit": 100000, "used": 3200, "excess": 1200,
+                 "token": "新凭证…", "confirmedMeasurements": [ ] }
+  }
+}
+```
+
+沿用旧接口 `POST /api/exhibits/:id/limits` 直接下调时**不需要凭证**：在同一事务即时重算，
+成功响应仍是展品详情（兼容），另附 `overflows` 与 `flaggedPlans`；不超额/上调/首次登记时两者为空、
+`limitLowered` 为 `null`。
+
 
 
 ```
@@ -231,9 +324,10 @@ src/
   schema.sql       表结构
   auth.js          会话与角色中间件、bcrypt 登录校验
   audit.js         操作流水写入
+  limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对
+  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对、下调上限预演核算
   routes/          auth/users/exhibits/plans/adjustments/measurements/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试

@@ -176,6 +176,7 @@ async function openDetail(id) {
   $('#exhibit-list').classList.add('hidden');
   $('#new-exhibit-btn').classList.add('hidden');
   $('#exhibit-detail').classList.remove('hidden');
+  hideLimitPreview();
   renderDetail();
 }
 $('#close-detail').addEventListener('click', () => {
@@ -344,10 +345,138 @@ $('#limit-form').addEventListener('submit', async (e) => {
       limitLxh: Number(fd.get('limitLxh')),
     });
     state.detail = detail;
+    hideLimitPreview();
     renderDetail();
-    flash('success', '年度上限已保存');
+    if (detail.limitLowered) {
+      const lv = detail.limitLowered;
+      flash('warn',
+        `年度上限已下调（${lv.year} 年：${fmtN(lv.previousLimit)} → ${fmtN(lv.newLimit)} lx·h），预计超额 ${fmtN(lv.excess)} lx·h`,
+        limitLoweredExtrasHtml(detail));
+    } else {
+      flash('success', '年度上限已保存');
+    }
   } catch (err) { flash('error', err.message); }
 });
+
+// ---------- 下调年度上限：预演 + 携凭证提交 ----------
+function hideLimitPreview() {
+  const box = $('#limit-preview-box');
+  box.classList.add('hidden');
+  box.innerHTML = '';
+}
+
+function limitLoweredExtrasHtml(detail) {
+  const flagged = detail.flaggedPlans || [];
+  return (flagged.length
+    ? '<div>已转为待复核的未开始计划：' +
+      flagged.map((p) => `#${p.id}《${esc(p.title)}》`).join('、') + '</div>'
+    : '<div>该年没有仍在占用估算残余且尚未开始的已批准计划（已开始计划不转状态，剩余超额仍如实显示）。</div>');
+}
+
+/** 渲染一次预演结果（含提交按钮；stale=true 表示这是提交被拒后的最新结果）。 */
+function renderLimitPreview(pv, { stale = false } = {}) {
+  const box = $('#limit-preview-box');
+  box.classList.remove('hidden');
+  const measRows = (pv.confirmedMeasurements || []).map((m) =>
+    `<tr><td>#${m.id}（计划 #${m.planId}）</td><td>${esc(m.start)} ~ ${esc(m.end)}</td>
+      <td class="mono">${fmtN(m.lux)}</td><td class="mono">${fmtN(m.yearDose)}</td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted">该年暂无已确认实测</td></tr>';
+  const planRows = (pv.planResidues || []).map((p) =>
+    `<tr class="${p.status === 'pending_review' ? 'over-row' : ''}">
+      <td>#${p.id} ${esc(p.title)} ${badge(p.status)}</td>
+      <td>${esc(p.startDate)} ~ ${esc(p.endDate)}</td>
+      <td class="mono">${fmtN(p.yearResidue)}</td>
+      <td>${p.notStarted ? '<span class="ok">尚未开始</span>' : '<span class="muted">已开始（不转状态）</span>'}</td>
+     </tr>`).join('')
+    || '<tr><td colspan="4" class="muted">该年暂无已批准/待复核计划的估算残余</td></tr>';
+  const flagged = pv.flagCandidates || [];
+  const started = pv.startedResiduePlans || [];
+  const head = pv.over
+    ? `<div class="adj-conflict"><b>预计 ${pv.year} 年超额 ${fmtN(pv.excess)} lx·h</b>
+        （上限 ${fmtN(pv.proposedLimit)}，已确认实测 + 各计划估算残余合计 ${fmtN(pv.used)}）</div>`
+    : `<div class="adj-ok">下调后 ${pv.year} 年仍有 ${fmtN(pv.remaining)} lx·h 剩余额度，不超额。</div>`;
+  const flaggedHtml = pv.over
+    ? `<div class="small" style="margin:6px 0">
+        ${flagged.length
+          ? '提交后以下 <b>' + flagged.length + '</b> 条仍有该年估算残余且尚未开始的已批准计划将转为「待复核」：'
+            + flagged.map((p) => `#${p.id}《${esc(p.title)}》（残余 ${fmtN(p.yearResidue)}，首次开灯 ${esc(p.firstStart)}）`).join('、')
+          : '没有可转待复核的未开始计划。'}
+        ${started.length
+          ? '<br>已开始、仍在占用该年估算残余的计划（不转状态，剩余超额仍显示）：'
+            + started.map((p) => `#${p.id}《${esc(p.title)}》（残余 ${fmtN(p.yearResidue)}）`).join('、')
+          : ''}
+      </div>`
+    : '';
+  box.innerHTML = `
+    <div class="panel-head">
+      <h4>下调预演：${state.detail.exhibit.name} / ${pv.year} 年</h4>
+      <button type="button" class="link" id="limit-preview-close">收起</button>
+    </div>
+    ${stale ? '<div class="adj-conflict">额度或相关占用自预演后已变化，以下为最新核算结果，请确认后重新提交。</div>' : ''}
+    <div class="small muted">现行上限 <b>${fmtN(pv.currentLimit)}</b> → 拟定上限 <b>${fmtN(pv.proposedLimit)}</b> lx·h；预演不修改任何数据。</div>
+    ${head}
+    <table class="data" style="margin-top:8px">
+      <thead><tr><th>该年已确认实测</th><th>时段</th><th>实测照度 lx</th><th>该年剂量 lx·h</th></tr></thead>
+      <tbody>${measRows}</tbody>
+    </table>
+    <table class="data" style="margin-top:8px">
+      <thead><tr><th>已批准/待复核计划</th><th>展期</th><th>该年估算残余 lx·h</th><th>是否尚未开始</th></tr></thead>
+      <tbody>${planRows}</tbody>
+    </table>
+    ${flaggedHtml}
+    <div class="adj-btns">
+      <button type="button" class="primary" id="limit-lower-confirm">按 ${fmtN(pv.proposedLimit)} lx·h 提交下调</button>
+    </div>`;
+  $('#limit-preview-close').addEventListener('click', hideLimitPreview);
+  $('#limit-lower-confirm').addEventListener('click', () => submitLower(pv));
+}
+
+$('#limit-preview-btn').addEventListener('click', async () => {
+  const form = $('#limit-form');
+  const year = Number(form.elements.year.value);
+  const limitLxh = Number(form.elements.limitLxh.value);
+  if (!Number.isInteger(year) || !(limitLxh > 0)) {
+    flash('error', '请先填写 1900-2999 的年份与正数上限');
+    return;
+  }
+  try {
+    const { preview } = await api('POST',
+      `/api/exhibits/${state.detail.exhibit.id}/limits/preview`, { year, limitLxh });
+    renderLimitPreview(preview);
+    flash('success', '预演完成：请核对核算结果后在下方确认提交（预演未改动任何数据）');
+  } catch (err) { flash('error', err.message); }
+});
+
+/** 携预演凭证提交下调。 */
+async function submitLower(pv) {
+  try {
+    const detail = await api('POST', `/api/exhibits/${state.detail.exhibit.id}/limits/lower`, {
+      year: pv.year,
+      limitLxh: pv.proposedLimit,
+      token: pv.token,
+    });
+    state.detail = detail;
+    hideLimitPreview();
+    renderDetail();
+    if (detail.overflows && detail.overflows.length) {
+      const o = detail.overflows[0];
+      flash('warn',
+        `年度上限已下调（${o.year} 年：${fmtN(o.previousLimit)} → ${fmtN(o.limit)} lx·h），预计超额 ${fmtN(o.excess)} lx·h`,
+        limitLoweredExtrasHtml(detail));
+    } else {
+      flash('success', '年度上限已下调');
+    }
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.details && err.data.details.preview) {
+      state.detail = await api('GET', `/api/exhibits/${state.detail.exhibit.id}`);
+      renderDetail();
+      renderLimitPreview(err.data.details.preview, { stale: true });
+      flash('warn', '额度或相关占用已变化，下调未执行，已返回最新预演结果');
+    } else {
+      flash('error', err.message);
+    }
+  }
+}
 
 async function planAction(btn) {
   const id = btn.dataset.id;

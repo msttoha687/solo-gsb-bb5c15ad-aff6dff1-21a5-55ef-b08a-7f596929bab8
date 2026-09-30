@@ -599,6 +599,136 @@ function serializeAdjustment(a) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 下调年度上限：预演核算
+// ---------------------------------------------------------------------------
+
+/**
+ * 预演把某展品某自然年上限降到 proposedLimit 后的额度核算（不写库）。
+ * 返回内容：
+ *  - 该年已确认实测（逐条，含按年剂量）
+ *  - 各已批准/待复核计划在该年的估算残余
+ *  - 预计合计/剩余/超额量
+ *  - 超额时仍在该年有估算残余且尚未开始的已批准计划（flagCandidates）
+ *  - fingerprint：当前占用快照指纹（供预演凭证校验“额度或相关占用是否已变化”）
+ *
+ * 口径与 computeOccupancy 完全一致（已确认实测 + 计划估算残余）。
+ * 该年尚未登记上限时返回 400（下调必须针对既有上限；登记新上限请用 limits 接口）。
+ */
+async function computeLimitPreview(client, exhibitId, year, proposedLimit, { nowMs = Date.now() } = {}) {
+  const yearStr = String(year);
+  const { rows: limitRows } = await client.query(
+    'SELECT year, limit_lxh FROM annual_limits WHERE exhibit_id = $1 AND year = $2 FOR UPDATE',
+    [exhibitId, year]
+  );
+  if (limitRows.length === 0) {
+    throw new ValidationError(`${year} 年尚未登记年度上限，不能下调；请先登记该年度上限`);
+  }
+  const currentLimit = round3(Number(limitRows[0].limit_lxh));
+
+  const occupancy = await computeOccupancy(client, exhibitId);
+  const used = round3(occupancy.used[yearStr] || 0);
+  const excess = used - proposedLimit > 0.005 ? round3(used - proposedLimit) : 0;
+
+  // 该年已确认实测（仅列在该年剂量 > 0 的，避免无关年份噪音）
+  const confirmedMeasurements = occupancy.sources
+    .filter((s) => s.kind === 'measurement' && (s.yearly[yearStr] || 0) > 0)
+    .map((s) => ({
+      id: s.id,
+      planId: s.planId,
+      start: s.start,
+      end: s.end,
+      lux: s.lux,
+      yearDose: round3(s.yearly[yearStr]),
+      yearly: s.yearly,
+    }));
+
+  // 各已批准/待复核计划在该年的估算残余
+  const planById = new Map(occupancy.plans.map((p) => [p.id, p]));
+  const planResidues = occupancy.sources
+    .filter((s) => s.kind === 'plan' && (s.yearly[yearStr] || 0) > 0)
+    .map((s) => {
+      const firstStart = Math.min(...planWindows(planById.get(s.id)).map((w) => w.start));
+      return {
+        id: s.id,
+        title: s.title,
+        status: s.status,
+        startDate: s.startDate,
+        endDate: s.endDate,
+        periods: normalizePeriods(s.periods),
+        lux: s.lux,
+        yearResidue: round3(s.yearly[yearStr]),
+        firstStart: tsToWallString(firstStart),
+        notStarted: s.status === 'approved' && firstStart > nowMs,
+      };
+    });
+
+  // 超额时：仍在该年有估算残余、且尚未开始的已批准计划（下调成功后将转待复核）
+  const flagCandidates = excess > 0
+    ? planResidues.filter((p) => p.status === 'approved' && p.notStarted)
+    : [];
+  // 已开始但仍占用该年残余的计划：不转状态，但剩余超额仍如实显示
+  const startedResiduePlans = excess > 0
+    ? planResidues.filter((p) => p.status === 'approved' && !p.notStarted)
+    : [];
+
+  // ---- 凭证指纹快照：覆盖上限/未作废实测/占用计划/时刻 ----
+  const { rows: allMeasRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts, actual_lux, status
+       FROM measurements
+      WHERE exhibit_id = $1 AND status <> 'annulled'
+      ORDER BY id`,
+    [exhibitId]
+  );
+  const fingerprintMeasures = allMeasRows.map((m) => ({
+    id: m.id,
+    planId: m.plan_id,
+    start: new Date(m.start_ts).getTime(),
+    end: new Date(m.end_ts).getTime(),
+    lux: Number(m.actual_lux),
+    status: m.status,
+  }));
+  const fingerprintPlans = occupancy.plans.map((p) => ({
+    id: p.id,
+    status: p.status,
+    startDate: dateYmd(p.start_date),
+    endDate: dateYmd(p.end_date),
+    periods: normalizePeriods(p.light_periods),
+    lux: Number(p.estimated_lux),
+    yearResidue: round3(
+      (occupancy.sources.find((s) => s.kind === 'plan' && s.id === p.id) || { yearly: {} })
+        .yearly[yearStr] || 0
+    ),
+  }));
+  // 此刻已开始（首个开灯时刻已过）的已批准计划 id：时间相关状态仅体现在这里
+  const startedPlanIds = occupancy.plans
+    .filter((p) => p.status === 'approved')
+    .filter((p) => Math.min(...planWindows(p).map((w) => w.start)) <= nowMs)
+    .map((p) => p.id)
+    .sort((a, b) => a - b);
+
+  return {
+    exhibitId,
+    year,
+    currentLimit,
+    proposedLimit: round3(proposedLimit),
+    used,
+    remaining: round3(proposedLimit - used),
+    excess,
+    over: excess > 0,
+    confirmedMeasurements,
+    planResidues,
+    flagCandidates,
+    startedResiduePlans,
+    signature: {
+      currentLimit,
+      measurements: fingerprintMeasures,
+      plans: fingerprintPlans,
+      startedPlanIds,
+    },
+  };
+}
+
 module.exports = {
   ACTIVE_PLAN_STATUSES,
   lockExhibit,
@@ -612,6 +742,7 @@ module.exports = {
   planOverlaps,
   validateMeasurementWindow,
   plansToFlag,
+  computeLimitPreview,
   yearOfTs,
   // 调整申请
   normalizeScheduleInput,
